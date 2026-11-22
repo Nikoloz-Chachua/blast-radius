@@ -672,6 +672,10 @@ class Selector:
             else:  # body statements of a class or module
                 self.nonfunc_change = True
                 if cls is None:
+                    lam = self.lambda_body_tests(rel, node, other[1], touched) if other else None
+                    if lam is not None:
+                        picked |= lam
+                        continue
                     picked |= self.file_scope(rel)
                     names_needing_refs |= self.changed_names(node, other[1] if other else [])
                 else:
@@ -1160,9 +1164,20 @@ class Selector:
 
     def class_attr_change(self, rel, ou, cls, old_nodes, new_nodes, touched):
         """A class-level statement changed (e.g. a FUNCTIONS dict entry or WEEK_OFFSET)."""
+        lam = self.lambda_body_tests(rel, old_nodes, new_nodes, touched)
+        if lam is not None:
+            return lam
         new_d = {ast.dump(n) for n in new_nodes}
         changed = [n for n in old_nodes if ast.dump(n) not in new_d]
-        # 1. edits that sit entirely inside lambda bodies run at call time: line coverage is exact
+        # 2.-4. below
+        return self._class_attr_rest(rel, ou, cls, old_nodes, new_nodes, changed)
+
+    def lambda_body_tests(self, rel, old_nodes, new_nodes, touched):
+        """Edits that sit entirely inside lambda bodies run at call time: the tests that ran those
+        body lines (runtime coverage) are exact. None when any edit is outside a lambda body, or a
+        body line also ran while modules imported (its result may be baked in)."""
+        new_d = {ast.dump(n) for n in new_nodes}
+        changed = [n for n in old_nodes if ast.dump(n) not in new_d]
         lam_lines = set()
         all_in_lambda = bool(changed)
         for st in changed:
@@ -1179,12 +1194,15 @@ class Selector:
                 all_in_lambda = False
         if len(new_nodes) != len(old_nodes):
             all_in_lambda = False
-        if all_in_lambda and lam_lines:
+        if all_in_lambda and lam_lines and not (lam_lines & self.cov.eager.get(rel, set())):
             per = (self.cov.runtime or self.cov).file(rel)
             got = set()
             for l in lam_lines:
                 got.update(per.get(l, ()))
             return got
+        return None
+
+    def _class_attr_rest(self, rel, ou, cls, old_nodes, new_nodes, changed):
         # 2. a class-level dict literal where only entries changed: the tests that looked up a changed
         #    key (or read the whole dict) at run time
         dk = self.dict_key_tests(rel, cls, old_nodes, new_nodes)
