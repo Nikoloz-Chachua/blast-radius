@@ -33,6 +33,9 @@ class CovMap:
         self.lines = raw["lines"]
         self.fix = raw["fix"]
         self.cls = raw.get("cls", {})
+        self.unstable = {k: set(v) for k, v in raw.get("unstable", {}).items()}
+        cp = path.parent / "cmpmap.json.gz"
+        self.cmp = json.loads(gzip.decompress(cp.read_bytes())) if cp.exists() else {}
         self._cache = {}
 
     def file(self, rel):
@@ -179,6 +182,46 @@ class _Canon(ast.NodeTransformer):
         return node
 
 
+CMP_NAMES = {ast.Eq: "eq", ast.NotEq: "ne", ast.Lt: "lt", ast.LtE: "le", ast.Gt: "gt", ast.GtE: "ge",
+             ast.Is: "is", ast.IsNot: "isnot", ast.In: "in", ast.NotIn: "notin"}
+CMP_FAMILY = {"eq": ("eq", "ne", "is", "isnot", "lt", "le", "gt", "ge"),
+              "ne": ("eq", "ne", "is", "isnot", "lt", "le", "gt", "ge"),
+              "is": ("is", "isnot", "eq", "ne"), "isnot": ("is", "isnot", "eq", "ne"),
+              "lt": ("lt", "le", "gt", "ge", "eq", "ne"), "le": ("lt", "le", "gt", "ge", "eq", "ne"),
+              "gt": ("lt", "le", "gt", "ge", "eq", "ne"), "ge": ("lt", "le", "gt", "ge", "eq", "ne"),
+              "in": ("in", "notin"), "notin": ("in", "notin")}
+
+
+def single_cmp_swap(old_fn, new_fn):
+    """If the only difference is one comparison operator, return (lineno, col, old_op, new_op)."""
+    a, b = list(ast.walk(old_fn)), list(ast.walk(new_fn))
+    if len(a) != len(b):
+        return None
+    found = None
+    for x, y in zip(a, b):
+        if type(x) is not type(y):
+            if isinstance(x, ast.cmpop) and isinstance(y, ast.cmpop):
+                continue  # judged at the Compare node
+            return None
+        if isinstance(x, ast.Compare):
+            if [type(o) for o in x.ops] != [type(o) for o in y.ops]:
+                if found is not None or len(x.ops) != 1:
+                    return None
+                ox, oy = CMP_NAMES.get(type(x.ops[0])), CMP_NAMES.get(type(y.ops[0]))
+                if ox is None or oy is None:
+                    return None
+                found = (x.lineno, x.col_offset, ox, oy)
+            continue
+        if isinstance(x, ast.cmpop):
+            continue
+        for field, vx in ast.iter_fields(x):
+            if isinstance(vx, ast.AST) or (isinstance(vx, list) and vx and isinstance(vx[0], ast.AST)):
+                continue
+            if vx != getattr(y, field, None):
+                return None
+    return found
+
+
 def canon(tree):
     return _Canon().visit(tree)
 
@@ -229,6 +272,24 @@ def node_range(node):
     return start, node.end_lineno
 
 
+# tests that run sqlglot in a child process (coverage cannot see inside it)
+SUBPROCESS_TESTS = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}
+# test classes that build shared state in setUpClass
+SETUP_CLASSES = {"tests/test_executor.py::TestExecutor", "tests/test_optimizer.py::TestOptimizer",
+                 "tests/test_lineage.py::TestLineage", "tests/test_sqlglotc.py::TestSQLGlotC"}
+# modules imported by a bare `import sqlglot`
+EAGER_MODULES = {
+    "sqlglot/__init__.py", "sqlglot/_typing.py", "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py",
+    "sqlglot/diff.py", "sqlglot/errors.py", "sqlglot/expressions/__init__.py", "sqlglot/expressions/aggregate.py",
+    "sqlglot/expressions/array.py", "sqlglot/expressions/builders.py", "sqlglot/expressions/constraints.py",
+    "sqlglot/expressions/core.py", "sqlglot/expressions/datatypes.py", "sqlglot/expressions/ddl.py",
+    "sqlglot/expressions/dml.py", "sqlglot/expressions/functions.py", "sqlglot/expressions/json.py",
+    "sqlglot/expressions/math.py", "sqlglot/expressions/properties.py", "sqlglot/expressions/query.py",
+    "sqlglot/expressions/string.py", "sqlglot/expressions/temporal.py", "sqlglot/generator.py",
+    "sqlglot/helper.py", "sqlglot/jsonpath.py", "sqlglot/optimizer/__init__.py", "sqlglot/optimizer/scope.py",
+    "sqlglot/parser.py", "sqlglot/parsers/__init__.py", "sqlglot/parsers/base.py", "sqlglot/schema.py",
+    "sqlglot/time.py", "sqlglot/tokenizer_core.py", "sqlglot/tokens.py", "sqlglot/trie.py", "sqlglot/typing/__init__.py",
+}
 BASE_STEMS = {"dialect", "__init__", "parser", "generator", "tokens", "tokenizer", "core", "base", "helper"}
 
 
@@ -253,6 +314,13 @@ class Selector:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
         self._src_cache = {}
         self._py_files = None
+        self.import_time_files = {}
+        self._overlay = None
+        self.subprocess_tests = {t["number"] for t in tests if t["id"] in SUBPROCESS_TESTS}
+        self.by_class = {}
+        for t in tests:
+            self.by_class.setdefault(t["id"].rsplit("::", 1)[0], set()).add(t["number"])
+        self.cls_of = {t["number"]: t["id"].rsplit("::", 1)[0] for t in tests}
 
     def read(self, rel):
         if rel not in self._src_cache:
@@ -375,10 +443,20 @@ class Selector:
         try:
             new_tree = ast.parse(new_text)
         except SyntaxError:
-            # broken module: everything that uses or imports it
-            return self.file_scope(rel) | self.module_importers(rel)
+            # broken module: imports fail all over the suite
+            return set(self.all)
         ou, nu = units(canon(old_tree)), units(canon(new_tree))
         touched = changed_old_lines(hunks)
+        uns = self.cov.unstable.get(rel, set())
+        import_time = bool(touched & uns) or set(ou) != set(nu) or any(
+            k in ("body", "class") and nu.get(n) is not None and nu[n][2] != d
+            for n, (k, _, d, _) in ou.items())
+        if import_time and rel.startswith("sqlglot/"):
+            self.import_time_files[rel] = new_text
+        if import_time and rel in EAGER_MODULES:
+            picked_extra = set(self.subprocess_tests)
+        else:
+            picked_extra = set()
         picked = set()
         names_needing_refs = set()
         for name, (kind, node, dump, cls) in ou.items():
@@ -389,6 +467,7 @@ class Selector:
                 rng = node_range(node)
                 whole = self.cov.range(rel, *rng)
                 got = None
+                want = None
                 if other is not None and sig_dump(node) == sig_dump(other[1]):
                     lines = {l for l in touched if rng[0] <= l <= rng[1]}
                     want = self.stmt_lines(node, lines) if lines else None
@@ -397,7 +476,18 @@ class Selector:
                         per = self.cov.file(rel)
                         for l in want:
                             got.update(per.get(l, ()))
+                if got is not None and other is not None:
+                    got = self.cmp_refine(rel, old_text, new_text, name, got)
                 picked |= whole if got is None else got
+                # lines that run once per process (imports, caches): coverage only credits the
+                # first test, so treat the edit as affecting every user of this module/class
+                uns = self.cov.unstable.get(rel, set())
+                lines_here = {l for l in touched if rng[0] <= l <= rng[1]}
+                if uns and (lines_here & uns or (got is not None and want and set(want) & uns)):
+                    picked |= whole | self.file_scope(rel)
+                    if cls:
+                        picked |= self.class_users(rel, cls.split(".")[0]) or set()
+                    picked |= self.setup_class_expand(picked)
                 if other is None:
                     # removed method: anything using its class may now dispatch differently
                     picked |= self.class_scope(rel, ou, cls)
@@ -435,6 +525,42 @@ class Selector:
         qual = ".".join(part.split("#")[0] for part in cls.split("."))
         got = self.cov.cls.get(f"{mod}:{qual}")
         return set(got) if got is not None else None
+
+    def setup_class_expand(self, picked):
+        """Classes with setUpClass build shared state once; credit goes to their first test only."""
+        extra = set()
+        for n in picked:
+            c = self.cls_of[n]
+            if c in SETUP_CLASSES:
+                extra |= self.by_class.get(c, set())
+        return extra
+
+    def cmp_refine(self, rel, old_text, new_text, name, got):
+        """Drop tests that evaluated the swapped comparison and never saw old/new disagree."""
+        try:
+            ro, rn = units(ast.parse(old_text)), units(ast.parse(new_text))
+            swap = single_cmp_swap(ro[name][1], rn[name][1])
+        except Exception:
+            return got
+        if swap is None:
+            return got
+        line, col, op_old, op_new = swap
+        if line in self.cov.unstable.get(rel, set()):
+            return got
+        fam = CMP_FAMILY[op_old]
+        if op_new not in fam:
+            return got
+        rec = self.cov.cmp.get(f"{rel}:{line}:{col}")
+        if rec is None:
+            return got  # never recorded: keep coverage's answer
+        i, j = fam.index(op_old), fam.index(op_new)
+        seen, differ = set(), set()
+        for vec_s, tests in rec.items():
+            vec = json.loads(vec_s)
+            seen.update(tests)
+            if vec[i] != vec[j]:
+                differ.update(tests)
+        return got - (seen - differ)
 
     def class_attr_change(self, rel, ou, cls, old_nodes, new_nodes, touched):
         """A class-level statement changed (e.g. a FUNCTIONS dict entry or WEEK_OFFSET)."""
@@ -495,7 +621,73 @@ class Selector:
         last = mod.split(".")[-1]
         return self.references({last})
 
+    CHECK = (
+        "import importlib, json, pkgutil, sys\n"
+        "bad = []\n"
+        "try:\n"
+        "    import sqlglot\n"
+        "except BaseException as e:\n"
+        "    print(json.dumps(['sqlglot'])); sys.exit(0)\n"
+        "for info in pkgutil.walk_packages(sqlglot.__path__, prefix='sqlglot.'):\n"
+        "    if info.name == 'sqlglot.__main__': continue\n"
+        "    try: importlib.import_module(info.name)\n"
+        "    except BaseException: bad.append(info.name)\n"
+        "try:\n"
+        "    from sqlglot.dialects.dialect import Dialect\n"
+        "    for k, c in sorted(Dialect.classes.items()):\n"
+        "        try:\n"
+        "            d = c(); d.tokenizer; d.parser(); d.generator()\n"
+        "        except BaseException: bad.append('dialect:' + k)\n"
+        "except BaseException: bad.append('dialects')\n"
+        "print(json.dumps(sorted(bad)))\n"
+    )
+
+    def _run_check(self):
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=self._overlay, PYTHONDONTWRITEBYTECODE="1")
+        r = subprocess.run([sys.executable, "-c", self.CHECK], cwd=self._overlay, env=env,
+                           capture_output=True, text=True, timeout=60)
+        lines = [l for l in r.stdout.splitlines() if l.startswith("[")]
+        if r.returncode != 0 or not lines:
+            return None
+        return set(json.loads(lines[-1]))
+
+    def import_ok(self, files):
+        """Apply the new texts to a scratch copy of sqlglot; import every module and build every
+        dialect. Anything that breaks compared with the unpatched copy means a broken import."""
+        import shutil, tempfile
+        try:
+            if self._overlay is None:
+                self._overlay = tempfile.mkdtemp(prefix="br_")
+                shutil.copytree(self.src / "sqlglot", os.path.join(self._overlay, "sqlglot"))
+                self._baseline = self._run_check()
+                log(f"import check baseline: {self._baseline}")
+            if self._baseline is None:
+                return False
+            for rel, text in files.items():
+                with open(os.path.join(self._overlay, rel), "w") as fh:
+                    fh.write(text)
+            got = self._run_check()
+            return got is not None and got <= self._baseline
+        except Exception as e:
+            log(f"import check error {e!r}")
+            return False
+        finally:
+            for rel in files:
+                src = self.src / rel
+                dst = os.path.join(self._overlay, rel) if self._overlay else None
+                if dst and src.exists():
+                    shutil.copy2(src, dst)
+
     def select(self, patch_text):
+        self.import_time_files = {}
+        picked = self._select(patch_text)
+        if self.import_time_files and not self.import_ok(self.import_time_files):
+            log("import fails after this patch: selecting everything")
+            return set(self.all)
+        return picked
+
+    def _select(self, patch_text):
         picked = set()
         for f in parse_patch(patch_text):
             rel = f["old"] or f["new"]
@@ -517,6 +709,10 @@ class Selector:
                 picked |= self.python_change(rel, old_text, new_text, f["hunks"])
             elif rel.startswith("tests/fixtures/") or rel.startswith("tests/"):
                 got = set(self.cov.fix.get(rel, ()))
+                if got and not rel.endswith(".sql"):
+                    # data files are often loaded once per class (setUpClass): whole classes
+                    for n in list(got):
+                        got |= self.by_class.get(self.cls_of[n], set())
                 if not got:
                     base = rel.split("/")[-1]
                     stem = base.split(".")[0]
