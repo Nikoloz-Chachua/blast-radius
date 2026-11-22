@@ -39,8 +39,8 @@ For each patch, `selector.py`:
      otherwise full execution for up to 30 entries. Class-level edits in dialect-specific modules are
      checked with the early stages of every entry.
    - `test_max_nodes` (28.8 s): every column of its giant query is identical, so a scaled replica
-     (`maxnodes_harness.py`) runs the same calls in the same order; dropped when the replica's digest
-     is unchanged and the changed lines are all reached by the replica (`maxnodes_cov.json`).
+     (`maxnodes_harness.py`) runs the same calls in the same order and makes the test's own assertions; dropped when they all give the unpatched outcomes, the replica is not markedly slower
+     and the changed lines are all reached by the replica (`maxnodes_cov.json`).
    - `test_generator_memory`: kept only for generator-related changes, and then its own loop runs on
      the patched code for the affected dialects only (`genmem_harness.py`).
 7. Splits the chosen tests across 1–8 workers, picking the worker count with the lowest cost.

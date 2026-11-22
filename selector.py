@@ -234,8 +234,50 @@ def canon(tree):
     return _Canon().visit(tree)
 
 
-def units(tree):
-    """Map qualified name -> (kind, node, dump, parent_class_name)."""
+class LazyDump:
+    """Canonical AST dump of a unit, computed only when needed. Two units whose source lines the
+    patch did not touch are equal without dumping (same text, same AST)."""
+    __slots__ = ("nodes", "lines", "touched", "_v")
+
+    def __init__(self, nodes, lines, touched):
+        self.nodes, self.lines, self.touched, self._v = nodes, lines, touched, None
+
+    @property
+    def untouched(self):
+        return not (self.lines & self.touched)
+
+    @property
+    def value(self):
+        if self._v is None:
+            import copy
+            self._v = "|".join(ast.dump(_Canon().visit(copy.deepcopy(n))) for n in self.nodes)
+        return self._v
+
+    def __eq__(self, other):
+        if not isinstance(other, LazyDump):
+            return NotImplemented
+        if self.untouched and other.untouched and len(self.nodes) == len(other.nodes):
+            return True
+        return self.value == other.value
+
+    def __ne__(self, other):
+        r = self.__eq__(other)
+        return r if r is NotImplemented else not r
+
+    def __hash__(self):
+        return 0
+
+
+def _span(nodes):
+    out = set()
+    for n in nodes:
+        start = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])])
+        out.update(range(start, n.end_lineno + 1))
+    return out
+
+
+def units(tree, touched=frozenset()):
+    """Map qualified name -> (kind, node, dump, parent_class_name); dump is a LazyDump."""
     result = {}
 
     def visit(body, prefix, cls):
@@ -245,30 +287,50 @@ def units(tree):
                 name = f"{prefix}{node.name}"
                 if name in result:
                     name = f"{name}#{idx}"
-                result[name] = ("func", node, ast.dump(node), cls)
+                result[name] = ("func", node, LazyDump([node], _span([node]), touched), cls)
             elif isinstance(node, ast.ClassDef):
                 name = f"{prefix}{node.name}"
                 if name in result:
                     name = f"{name}#{idx}"
-                header = ast.dump(
-                    ast.ClassDef(
-                        name=node.name,
-                        bases=node.bases,
-                        keywords=node.keywords,
-                        body=[],
-                        decorator_list=node.decorator_list,
-                        type_params=getattr(node, "type_params", []),
-                    )
+                header = ast.ClassDef(
+                    name=node.name,
+                    bases=node.bases,
+                    keywords=node.keywords,
+                    body=[],
+                    decorator_list=node.decorator_list,
+                    type_params=getattr(node, "type_params", []),
                 )
-                result[name] = ("class", node, header, cls)
+                first = node.body[0].lineno if node.body else node.lineno + 1
+                hstart = min([node.lineno] + [d.lineno for d in node.decorator_list])
+                result[name] = ("class", node, LazyDump([header], set(range(hstart, first)), touched), cls)
                 visit(node.body, name + ".", name)
             else:
                 others.append(node)
         key = f"{prefix}<body>"
-        result[key] = ("body", others, "|".join(ast.dump(n) for n in others), cls)
+        result[key] = ("body", others, LazyDump(others, _span(others), touched), cls)
 
     visit(tree.body, "", None)
     return result
+
+
+def new_touched_lines(hunks):
+    """New-file line numbers touched by the hunks (added lines and both sides of deletions)."""
+    touched = set()
+    offset = 0
+    for old_start, body in hunks:
+        pos = max(old_start, 1) + offset
+        for tag, _ in body:
+            if tag == " ":
+                pos += 1
+            elif tag == "-":
+                touched.add(pos)
+                touched.add(max(pos - 1, 1))
+                offset -= 1
+            elif tag == "+":
+                touched.add(pos)
+                pos += 1
+                offset += 1
+    return touched
 
 
 def node_range(node):
@@ -544,8 +606,9 @@ class Selector:
         except SyntaxError:
             # broken module: imports fail all over the suite
             return set(self.all)
-        ou, nu = units(canon(old_tree)), units(canon(new_tree))
         touched = changed_old_lines(hunks)
+        ou, nu = units(old_tree, touched), units(new_tree, new_touched_lines(hunks))
+        self._raw_units = (ou, nu)
         uns = self.cov.eager.get(rel, set())
         import_time = bool(touched & uns) or set(ou) != set(nu) or any(
             k in ("body", "class") and nu.get(n) is not None and nu[n][2] != d
@@ -778,7 +841,9 @@ class Selector:
             lines = [l for l in r.stdout.splitlines() if l.startswith("{")]
             if r.returncode != 0 or not lines:
                 return False
-            ok = json.loads(lines[-1]) == json.loads(MAXNODES_DIGEST.read_text())
+            got, base = json.loads(lines[-1]), json.loads(MAXNODES_DIGEST.read_text())
+            # same assertion outcomes, and not markedly slower (the real test runs ~29 s)
+            ok = got.get("maxnodes") == base.get("maxnodes") and got.get("cpu", 1e9) <= 2 * base.get("cpu", 0) + 0.3
             log(f"max_nodes proof: {'same' if ok else 'DIFFERENT'}")
             return ok
         except Exception as e:
@@ -1069,7 +1134,7 @@ class Selector:
     def cmp_refine(self, rel, old_text, new_text, name, got):
         """Drop tests that evaluated the swapped comparison and never saw old/new disagree."""
         try:
-            ro, rn = units(ast.parse(old_text)), units(ast.parse(new_text))
+            ro, rn = self._raw_units
             swap = single_cmp_swap(ro[name][1], rn[name][1])
         except Exception:
             return got

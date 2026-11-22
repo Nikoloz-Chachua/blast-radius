@@ -1,34 +1,43 @@
 """Scaled replica of tests/test_parser.py::TestParser::test_max_nodes. Every column of the test's
 giant query is the same `x=x=...` chain, so the max_nodes errors fire after the same first columns
-whatever the width; the replica runs the same calls on fewer columns and prints a digest."""
-import hashlib, json, sys
+whatever the width. The replica makes the test's own assertions on fewer columns and prints their
+outcomes plus its run time (a big slowdown could make the real 28.8 s test time out)."""
+import json, sys, time
 
 
-def digest():
-    from sqlglot import parse_one
+def outcomes():
+    from sqlglot import exp, parse_one
     from sqlglot.errors import ParseError
 
-    def run(sql, **kw):
+    def is_select(sql, **kw):
         try:
-            e = parse_one(sql, **kw)
-            return ("ok", type(e).__name__, e.sql(), sum(1 for _ in e.walk()))
-        except ParseError as ex:
-            return ("parse_error", str(ex))
-        except Exception as ex:  # anything else changes the test's outcome
-            return ("exc", type(ex).__name__, str(ex))
+            return isinstance(parse_one(sql, **kw), exp.Select)
+        except Exception as e:
+            return "raised:" + type(e).__name__
 
-    out = [run("SELECT 1", max_nodes=1_000_000)]
+    def raises(sql, needle, **kw):
+        try:
+            parse_one(sql, **kw)
+            return "no error"
+        except ParseError as e:
+            return needle in str(e)
+        except Exception as e:
+            return "raised:" + type(e).__name__
+
+    out = [is_select("SELECT 1", max_nodes=1_000_000)]
     cols = [f"col{i}" for i in range(500)]
-    out.append(run(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000))
+    out.append(is_select(f"SELECT {','.join(cols)} FROM t", max_nodes=1_000_000))
     expr = "x" + "=x" * 100
-    sql = f"SELECT {','.join(expr for _ in range(300))}"
-    out.append(run(sql, max_nodes=50_000))
-    out.append(run(sql, max_nodes=20_000))
-    out.append(run(f"SELECT {','.join(expr for _ in range(40))}", max_nodes=1_000_000))
-    out.append(run("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5))
-    out.append(run("SELECT 1, 2, 3"))
-    return hashlib.sha256(repr(out).encode()).hexdigest()[:16]
+    sql = f"SELECT {','.join(expr for _ in range(600))}"  # >50,000 nodes: errors fire as in the test
+    out.append(raises(sql, "Maximum number of AST nodes", max_nodes=20_000))
+    out.append(raises(sql, "(50000)", max_nodes=50_000))
+    out.append(is_select(f"SELECT {','.join(expr for _ in range(40))}", max_nodes=1_000_000))
+    out.append(raises("SELECT " + ",".join(f"x={i}" for i in range(100)), "", max_nodes=5))
+    out.append(is_select("SELECT 1, 2, 3"))
+    return out
 
 
 if __name__ == "__main__":
-    print(json.dumps({"maxnodes": digest()}))
+    t = time.process_time()
+    res = outcomes()
+    print(json.dumps({"maxnodes": res, "cpu": round(time.process_time() - t, 3)}))
