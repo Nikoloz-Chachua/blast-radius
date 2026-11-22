@@ -1340,6 +1340,20 @@ class Selector:
         files = [f["old"] or f["new"] for f in parse_patch(patch_text)]
         py = all(f.startswith("sqlglot/") and f.endswith(".py") for f in files)
         if self.import_time_files and not self.import_ok(self.import_time_files):
+            rels = list(self.import_time_files)
+            if (len(files) == 1 and rels == files and files[0].startswith("sqlglot/") and files[0].endswith(".py")
+                    and files[0] not in EAGER_MODULES and not self.cov.eager.get(files[0])):
+                # a lazily imported module no longer imports: only the tests that import it (they ran
+                # its import-time lines in their own process) can fail, plus child-process tests
+                rel = files[0]
+                rt = self.runtime_lines(rel)
+                importers = set()
+                for ln, ts in self.cov.file(rel).items():
+                    if ln not in rt:
+                        importers.update(ts)
+                if importers:
+                    log(f"import fails in lazily imported {rel}: {len(importers)} importers")
+                    return importers | self.subprocess_tests
             log("import fails after this patch: selecting everything")
             return set(self.all)
         # test_generator_memory: generator construction only (see GENMEM)
