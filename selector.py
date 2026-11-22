@@ -34,6 +34,10 @@ class CovMap:
         self.fix = raw["fix"]
         self.cls = raw.get("cls", {})
         self.unstable = {k: set(v) for k, v in raw.get("unstable", {}).items()}
+        self.eager = {k: set(v) for k, v in raw.get("eager", {}).items()}
+        self.fix_setup = raw.get("fix_setup", {})
+        rp = path.parent / "covmap_rt.json.gz"
+        self.runtime = CovMap(rp) if rp.exists() and path.name != "covmap_rt.json.gz" else None
         cp = path.parent / "cmpmap.json.gz"
         self.cmp = json.loads(gzip.decompress(cp.read_bytes())) if cp.exists() else {}
         self._cache = {}
@@ -280,6 +284,25 @@ SETUP_FIXTURE_USERS = {
     "tests/fixtures/optimizer/tpc-h/": [_EX + "test_optimized_tpch", _EX + "test_execute_tpch"],
     "tests/fixtures/optimizer/tpc-ds/": [_EX + "test_execute_tpcds"],
 }
+# dialect names (module stems under sqlglot/dialects, parsers, generators, tokenizers, typing)
+DIALECT_NAMES = {
+    "athena", "bigquery", "clickhouse", "databricks", "dax", "doris", "dremio", "drill", "druid", "duckdb", "dune",
+    "exasol", "fabric", "hive", "materialize", "mysql", "oracle", "postgres", "presto", "prql", "redshift",
+    "risingwave", "singlestore", "snowflake", "solr", "spark", "spark2", "sqlite", "starrocks", "tableau",
+    "teradata", "trino", "tsql",
+}
+# helpers that run while classes are being built at import time (their results are baked in)
+IMPORT_MACHINERY = {
+    "sqlglot/tokens.py": ("_convert_quotes", "_quotes_to_format"),
+    "sqlglot/dialects/dialect.py": ("_with_strict_time_inverse",),
+    "sqlglot/helper.py": ("subclasses",),
+    "sqlglot/trie.py": ("new_trie",),
+}
+# builds every dialect's generator 1000x and checks memory: only generator code can break it
+# (a dialect that fails to import is caught by the import check, which then selects everything)
+GENMEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
+GENMEM_FILES = ("sqlglot/generator.py", "sqlglot/generators/", "sqlglot/dialects/dialect.py",
+                "sqlglot/dialects/__init__.py", "sqlglot/helper.py")
 TPC_QUERY_FILES = {"tests/fixtures/optimizer/tpc-h/tpc-h.sql", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"}
 # test classes that build shared state in setUpClass
 # (class -> modules its setUpClass runs: executor tables + pool initializer, MappingSchema)
@@ -458,7 +481,7 @@ class Selector:
             return set(self.all)
         ou, nu = units(canon(old_tree)), units(canon(new_tree))
         touched = changed_old_lines(hunks)
-        uns = self.cov.unstable.get(rel, set())
+        uns = self.cov.eager.get(rel, set())
         import_time = bool(touched & uns) or set(ou) != set(nu) or any(
             k in ("body", "class") and nu.get(n) is not None and nu[n][2] != d
             for n, (k, _, d, _) in ou.items())
@@ -490,15 +513,11 @@ class Selector:
                 if got is not None and other is not None:
                     got = self.cmp_refine(rel, old_text, new_text, name, got)
                 picked |= whole if got is None else got
-                # lines that run once per process (imports, caches): coverage only credits the
-                # first test, so treat the edit as affecting every user of this module/class
-                uns = self.cov.unstable.get(rel, set())
-                lines_here = {l for l in touched if rng[0] <= l <= rng[1]}
-                if uns and (lines_here & uns or (got is not None and want and set(want) & uns)):
-                    picked |= whole | self.file_scope(rel)
-                    if cls:
-                        picked |= self.class_users(rel, cls.split(".")[0]) or set()
-                    picked |= self.setup_class_expand(picked, rel)
+                self.func_picked |= whole if got is None else got
+                # class-building code that runs while modules import (metaclasses, __init_subclass__):
+                # its results are baked into classes every test uses
+                if self.is_class_machinery(node, cls, ou, rel) and {l for l in touched if rng[0] <= l <= rng[1]} & self.cov.eager.get(rel, set()):
+                    picked |= set(self.all)
                 if other is None:
                     # removed method: anything using its class may now dispatch differently
                     picked |= self.class_scope(rel, ou, cls)
@@ -562,6 +581,19 @@ class Selector:
             return got - drop
         return got
 
+    def is_class_machinery(self, node, cls, ou, rel=None):
+        if node.name in ("__init_subclass__", "__set_name__", "__class_getitem__"):
+            return True
+        if rel is not None and node.name in IMPORT_MACHINERY.get(rel, ()):
+            return True
+        if cls and cls in ou:
+            cnode = ou[cls][1]
+            for b in cnode.bases:
+                name = b.id if isinstance(b, ast.Name) else b.attr if isinstance(b, ast.Attribute) else ""
+                if name == "type":
+                    return True
+        return False
+
     def setup_class_expand(self, picked, rel):
         """Classes with setUpClass build shared state once; credit goes to their first test only.
         Expand only when the changed module is one that setUpClass itself runs."""
@@ -622,7 +654,7 @@ class Selector:
         if len(new_nodes) != len(old_nodes):
             all_in_lambda = False
         if all_in_lambda and lam_lines:
-            per = self.cov.file(rel)
+            per = (self.cov.runtime or self.cov).file(rel)
             got = set()
             for l in lam_lines:
                 got.update(per.get(l, ()))
@@ -661,18 +693,21 @@ class Selector:
 
     CHECK = (
         "import importlib, json, pkgutil, sys\n"
+        "mods, dialects = json.loads(sys.argv[1]), json.loads(sys.argv[2])\n"
         "bad = []\n"
         "try:\n"
         "    import sqlglot\n"
         "except BaseException as e:\n"
         "    print(json.dumps(['sqlglot'])); sys.exit(0)\n"
-        "for info in pkgutil.walk_packages(sqlglot.__path__, prefix='sqlglot.'):\n"
-        "    if info.name == 'sqlglot.__main__': continue\n"
-        "    try: importlib.import_module(info.name)\n"
-        "    except BaseException: bad.append(info.name)\n"
+        "if mods == 'ALL':\n"
+        "    mods = [i.name for i in pkgutil.walk_packages(sqlglot.__path__, prefix='sqlglot.') if i.name != 'sqlglot.__main__']\n"
+        "for m in mods:\n"
+        "    try: importlib.import_module(m)\n"
+        "    except BaseException: bad.append(m)\n"
         "try:\n"
         "    from sqlglot.dialects.dialect import Dialect\n"
-        "    for k, c in sorted(Dialect.classes.items()):\n"
+        "    items = sorted(Dialect.classes.items()) if dialects == 'ALL' else [(k, Dialect.get_or_raise(k).__class__) for k in dialects]\n"
+        "    for k, c in items:\n"
         "        try:\n"
         "            d = c(); d.tokenizer; d.parser(); d.generator()\n"
         "        except BaseException: bad.append('dialect:' + k)\n"
@@ -680,15 +715,29 @@ class Selector:
         "print(json.dumps(sorted(bad)))\n"
     )
 
-    def _run_check(self):
+    def _run_check(self, mods="ALL", dialects="ALL"):
         import subprocess
         env = dict(os.environ, PYTHONPATH=self._overlay, PYTHONDONTWRITEBYTECODE="1")
-        r = subprocess.run([sys.executable, "-c", self.CHECK], cwd=self._overlay, env=env,
-                           capture_output=True, text=True, timeout=60)
+        r = subprocess.run([sys.executable, "-c", self.CHECK, json.dumps(mods), json.dumps(dialects)],
+                           cwd=self._overlay, env=env, capture_output=True, text=True, timeout=60)
         lines = [l for l in r.stdout.splitlines() if l.startswith("[")]
         if r.returncode != 0 or not lines:
             return None
         return set(json.loads(lines[-1]))
+
+    def _check_scope(self, files):
+        """Core (eagerly imported) modules: import everything and build every dialect.
+        A lazily imported module: import it and build the dialect it belongs to."""
+        if any(rel in EAGER_MODULES or not rel.startswith("sqlglot/") for rel in files):
+            return "ALL", "ALL"
+        mods, dialects = [], []
+        for rel in files:
+            mod = rel[:-3].replace("/", ".")
+            mods.append(mod[: -len(".__init__")] if mod.endswith(".__init__") else mod)
+            stem = rel.rsplit("/", 1)[-1][:-3]
+            if stem in DIALECT_NAMES:
+                dialects.append(stem)
+        return mods, dialects
 
     def import_ok(self, files):
         """Apply the new texts to a scratch copy of sqlglot; import every module and build every
@@ -705,7 +754,9 @@ class Selector:
             for rel, text in files.items():
                 with open(os.path.join(self._overlay, rel), "w") as fh:
                     fh.write(text)
-            got = self._run_check()
+            mods, dialects = self._check_scope(files)
+            got = self._run_check(mods, dialects)
+            log(f"import check on {sorted(files)}: {'ok' if got is not None and got <= self._baseline else 'BROKEN'}")
             return got is not None and got <= self._baseline
         except Exception as e:
             log(f"import check error {e!r}")
@@ -719,7 +770,13 @@ class Selector:
 
     def select(self, patch_text):
         self.import_time_files = {}
+        self.func_picked = set()
         picked = self._select(patch_text)
+        gm = self.num_of.get(GENMEM)
+        if gm in picked and gm not in self.func_picked:
+            files = [f["old"] or f["new"] for f in parse_patch(patch_text)]
+            if not any(f.startswith(GENMEM_FILES) for f in files):
+                picked.discard(gm)
         if self.import_time_files and not self.import_ok(self.import_time_files):
             log("import fails after this patch: selecting everything")
             return set(self.all)
@@ -747,6 +804,8 @@ class Selector:
                 picked |= self.python_change(rel, old_text, new_text, f["hunks"])
             elif rel.startswith("tests/fixtures/") or rel.startswith("tests/"):
                 got = set(self.cov.fix.get(rel, ()))
+                if rel in self.cov.fix_setup and not any(rel.startswith(p) for p in SETUP_FIXTURE_USERS):
+                    got |= set(self.cov.fix_setup[rel])
                 # files loaded once in TestExecutor.setUpClass: credit went to its first test only
                 for prefix, ids in SETUP_FIXTURE_USERS.items():
                     if rel.startswith(prefix):
