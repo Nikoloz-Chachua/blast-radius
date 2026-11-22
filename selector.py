@@ -38,6 +38,8 @@ class CovMap:
         self.fix_setup = raw.get("fix_setup", {})
         rp = path.parent / "covmap_rt.json.gz"
         self.runtime = CovMap(rp) if rp.exists() and path.name != "covmap_rt.json.gz" else None
+        dp = path.parent / "dkmap.json.gz"
+        self.dk = json.loads(gzip.decompress(dp.read_bytes())) if dp.exists() and path.name == "covmap.json.gz" else None
         cp = path.parent / "cmpmap.json.gz"
         self.cmp = json.loads(gzip.decompress(cp.read_bytes())) if cp.exists() else {}
         self._cache = {}
@@ -291,6 +293,14 @@ DIALECT_NAMES = {
     "risingwave", "singlestore", "snowflake", "solr", "spark", "spark2", "sqlite", "starrocks", "tableau",
     "teradata", "trino", "tsql",
 }
+# class settings that tokenizer/dialect class-building code compiles into other structures
+BAKED_NAMES = {
+    "BIT_STRINGS", "BYTE_STRINGS", "BYTE_STRING_ESCAPES", "COMMENTS", "HEREDOC_STRINGS", "HEX_STRINGS",
+    "IDENTIFIERS", "IDENTIFIER_ESCAPES", "KEYWORDS", "NATIONAL_RAW_STRINGS", "QUOTES", "RAW_STRINGS",
+    "SINGLE_TOKENS", "STRING_ESCAPES", "UNICODE_STRINGS", "NUMERIC_ESCAPES", "TIME_MAPPING", "FORMAT_MAPPING",
+    "INVERSE_TIME_MAPPING", "INVERSE_FORMAT_MAPPING", "CREATABLE_KIND_MAPPING", "DATE_PART_MAPPING",
+    "ESCAPED_SEQUENCES", "UNESCAPED_SEQUENCES", "TRANSFORMS", "VALID_INTERVAL_UNITS", "SUPPORTED_JSON_PATH_PARTS",
+}
 # helpers that run while classes are being built at import time (their results are baked in)
 IMPORT_MACHINERY = {
     "sqlglot/tokens.py": ("_convert_quotes", "_quotes_to_format"),
@@ -303,12 +313,22 @@ IMPORT_MACHINERY = {
 GENMEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
 GENMEM_FILES = ("sqlglot/generator.py", "sqlglot/generators/", "sqlglot/dialects/dialect.py",
                 "sqlglot/dialects/__init__.py", "sqlglot/helper.py")
+MAXNODES = "tests/test_parser.py::TestParser::test_max_nodes"
+MAXNODES_COV = HERE / "maxnodes_cov.json"
+MAXNODES_DIGEST = Path(os.environ.get("MAXNODES_DIGEST", "/app/maxnodes_digest.json"))
 TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_COV = HERE / "tpcds_cov.json.gz"
 TPCDS_DIGESTS = Path(os.environ.get("TPCDS_DIGESTS", "/app/tpcds_digests.json"))
 TPCDS_RAW = Path(os.environ.get("TPCDS_RAW", "/app/tpcds_raw.pkl"))
 TPCDS_EARLY = Path(os.environ.get("TPCDS_EARLY", "/app/tpcds_early.json"))
 TPCDS_MAX_ENTRIES = 30
+def is_dialect_module(rel):
+    """A dialect-specific module (not the shared base or the executor's Python dialect)."""
+    parts = rel.split("/")
+    return (len(parts) == 3 and parts[0] == "sqlglot" and parts[1] in ("dialects", "parsers", "generators", "tokenizers", "typing")
+            and parts[2][:-3] in DIALECT_NAMES and parts[2][:-3] != "python")
+
+
 TPC_QUERY_FILES = {"tests/fixtures/optimizer/tpc-h/tpc-h.sql", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"}
 # test classes that build shared state in setUpClass
 # (class -> modules its setUpClass runs: executor tables + pool initializer, MappingSchema)
@@ -352,6 +372,7 @@ class Selector:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
         self._src_cache = {}
         self._runtime = {}
+        self._derived = None
         self._py_files = None
         self.import_time_files = {}
         self._overlay = None
@@ -645,7 +666,80 @@ class Selector:
                     return True
         return False
 
-    def tpcds_proof(self):
+    def genmem_proof(self, files):
+        """Run test_generator_memory's own loop, on the patched code, for the dialects whose dialect or
+        generator classes come from the changed modules (the others run unchanged code)."""
+        import shutil, subprocess, tempfile
+        try:
+            mods = []
+            for rel in files:
+                mod = rel[:-3].replace("/", ".")
+                mods.append(mod[: -len(".__init__")] if mod.endswith(".__init__") else mod)
+            if self._overlay is None:
+                self._overlay = tempfile.mkdtemp(prefix="br_")
+                shutil.copytree(self.src / "sqlglot", os.path.join(self._overlay, "sqlglot"))
+            try:
+                for rel, text in self.patched_texts.items():
+                    with open(os.path.join(self._overlay, rel), "w") as fh:
+                        fh.write(text)
+                env = dict(os.environ, PYTHONPATH=self._overlay, PYTHONDONTWRITEBYTECODE="1")
+                r = subprocess.run([sys.executable, str(HERE / "genmem_harness.py"), json.dumps(mods), "8"],
+                                   cwd=self._overlay, env=env, capture_output=True, text=True, timeout=120)
+            finally:
+                for rel in self.patched_texts:
+                    src = self.src / rel
+                    if src.exists():
+                        shutil.copy2(src, os.path.join(self._overlay, rel))
+            lines = [l for l in r.stdout.splitlines() if l.startswith("{")]
+            if r.returncode != 0 or not lines:
+                return False
+            res = json.loads(lines[-1])
+            log(f"generator_memory check: {res}")
+            return bool(res.get("ok")) and res.get("dialects", 0) > 0
+        except Exception as e:
+            log(f"generator_memory check error {e!r}")
+            return False
+
+    def maxnodes_proof(self):
+        """Run the scaled replica of test_max_nodes on the patched code and compare its digest with
+        the unpatched one computed at build time."""
+        import shutil, subprocess, tempfile
+        try:
+            if not MAXNODES_COV.exists() or not MAXNODES_DIGEST.exists():
+                return False
+            replica = {(r, l) for r, l in json.loads(MAXNODES_COV.read_text())["replica"]}
+            for rel, lines in self.changed_lines.items():
+                for ln in lines:
+                    if self.num_of[MAXNODES] in self.cov.file(rel).get(ln, ()) and (rel, ln) not in replica:
+                        return False
+            if not self.patched_texts:
+                return False
+            if self._overlay is None:
+                self._overlay = tempfile.mkdtemp(prefix="br_")
+                shutil.copytree(self.src / "sqlglot", os.path.join(self._overlay, "sqlglot"))
+            try:
+                for rel, text in self.patched_texts.items():
+                    with open(os.path.join(self._overlay, rel), "w") as fh:
+                        fh.write(text)
+                env = dict(os.environ, PYTHONPATH=self._overlay, PYTHONDONTWRITEBYTECODE="1", PYTHONHASHSEED="0")
+                r = subprocess.run([sys.executable, str(HERE / "maxnodes_harness.py")], cwd=self._overlay, env=env,
+                                   capture_output=True, text=True, timeout=120)
+            finally:
+                for rel in self.patched_texts:
+                    src = self.src / rel
+                    if src.exists():
+                        shutil.copy2(src, os.path.join(self._overlay, rel))
+            lines = [l for l in r.stdout.splitlines() if l.startswith("{")]
+            if r.returncode != 0 or not lines:
+                return False
+            ok = json.loads(lines[-1]) == json.loads(MAXNODES_DIGEST.read_text())
+            log(f"max_nodes proof: {'same' if ok else 'DIFFERENT'}")
+            return ok
+        except Exception as e:
+            log(f"max_nodes proof error {e!r}")
+            return False
+
+    def tpcds_proof(self, all_early=False):
         """Re-run the TPC-DS entries that reach the changed lines on the patched code; True when
         every digest matches the unpatched one computed at build time."""
         import shutil, subprocess, tempfile
@@ -662,6 +756,13 @@ class Selector:
                 early = json.loads(TPCDS_EARLY.read_text()) if TPCDS_EARLY.exists() else None
                 self._tpcds = (setup, late, raw["entries"], json.loads(TPCDS_DIGESTS.read_text()), early)
             setup, late, entries, digests, early_digests = self._tpcds
+            if all_early:
+                if early_digests is None:
+                    return False
+                affected = {int(k) for k in early_digests}
+                mode = "early"
+                digests = early_digests
+                return self._tpcds_run(mode, affected, digests)
             affected = set()
             for rel, lines in self.changed_lines.items():
                 if lines & setup.get(rel, set()):
@@ -679,6 +780,14 @@ class Selector:
                 return False
             if mode == "early":
                 digests = early_digests
+            return self._tpcds_run(mode, affected, digests)
+        except Exception as e:
+            log(f"tpcds proof error {e!r}")
+            return False
+
+    def _tpcds_run(self, mode, affected, digests):
+        import shutil, subprocess, tempfile
+        try:
             if self._overlay is None:
                 self._overlay = tempfile.mkdtemp(prefix="br_")
                 shutil.copytree(self.src / "sqlglot", os.path.join(self._overlay, "sqlglot"))
@@ -719,6 +828,122 @@ class Selector:
             if prefixes and any(rel.startswith(p) for p in prefixes):
                 extra |= self.by_class.get(c, set())
         return extra
+
+    def _derived_names(self):
+        """Class-level names that some class body or module level reads other than through a
+        `{**X.NAME, ...}` merge into the same NAME: their values get baked into other attributes."""
+        if self._derived is None:
+            out = set(BAKED_NAMES)
+            for rel in self.py_files():
+                if not rel.startswith("sqlglot/"):
+                    continue
+                try:
+                    tree = ast.parse(self.read(rel) or "")
+                except SyntaxError:
+                    continue
+                def scan(stmts):
+                    for st in stmts:
+                        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            for d in st.decorator_list:
+                                for n in ast.walk(d):
+                                    if isinstance(n, ast.Attribute) and n.attr.isupper(): out.add(n.attr)
+                            continue
+                        if isinstance(st, ast.ClassDef):
+                            scan(st.body); continue
+                        own = None
+                        if isinstance(st, (ast.Assign, ast.AnnAssign)):
+                            tg = st.targets[0] if isinstance(st, ast.Assign) else st.target
+                            own = tg.id if isinstance(tg, ast.Name) else None
+                        val = getattr(st, "value", None)
+                        # keys-only tries (SHOW_TRIE = new_trie(k.split(" ") for k in SHOW_PARSERS)): an
+                        # added/removed key is handled by the added-key rule
+                        if isinstance(val, ast.Call) and isinstance(val.func, ast.Name) and val.func.id == "new_trie":
+                            continue
+                        for n in ast.walk(st):
+                            name = n.attr if isinstance(n, ast.Attribute) else n.id if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) else None
+                            # copies into the same name (subclass merges/filters) keep per-key semantics
+                            if name and name.isupper() and len(name) > 1 and name != own:
+                                out.add(name)
+                scan(tree.body)
+            self._derived = out
+        return self._derived
+
+    @staticmethod
+    def _key_reps(node):
+        if isinstance(node, ast.Constant):
+            return {repr(node.value)}
+        if isinstance(node, ast.Attribute):
+            base = node.value.attr if isinstance(node.value, ast.Attribute) else node.value.id if isinstance(node.value, ast.Name) else None
+            reps = {node.attr}
+            if base:
+                reps.add(f"{base}.{node.attr}")
+            return reps
+        if isinstance(node, ast.Name):
+            return {node.id}
+        if isinstance(node, ast.Tuple) and all(isinstance(e, ast.Constant) for e in node.elts):
+            return {repr(tuple(e.value for e in node.elts))}
+        return None
+
+    def dict_key_tests(self, rel, cls, old_nodes, new_nodes):
+        if not self.cov.dk or len(old_nodes) != len(new_nodes):
+            return None
+        mod = rel[:-3].replace("/", ".")
+        qual = ".".join(part.split("#")[0] for part in cls.split("."))
+        me = f"{mod}:{qual}"
+        owners = [o for o, m in self.cov.dk["mro"].items() if me in m]
+        if not owners:
+            return None
+        out = set()
+        changed_any = False
+        for a, b in zip(old_nodes, new_nodes):
+            if ast.dump(a) == ast.dump(b):
+                continue
+            changed_any = True
+            def parts(st):
+                if not isinstance(st, (ast.Assign, ast.AnnAssign)):
+                    return None
+                tg = st.targets[0] if isinstance(st, ast.Assign) else st.target
+                if isinstance(st, ast.Assign) and len(st.targets) != 1:
+                    return None
+                if not isinstance(tg, ast.Name) or not isinstance(st.value, ast.Dict):
+                    return None
+                return tg.id, st.value
+            pa, pb = parts(a), parts(b)
+            if pa is None or pb is None or pa[0] != pb[0]:
+                return None
+            name = pa[0]
+            if name in self._derived_names():
+                return None
+            def entries(d):
+                plain, unpack = {}, []
+                for k, v in zip(d.keys, d.values):
+                    if k is None:
+                        unpack.append(ast.dump(v))
+                    else:
+                        plain[ast.dump(k)] = (k, ast.dump(v))
+                return plain, unpack
+            (ea, ua), (eb, ub) = entries(pa[1]), entries(pb[1])
+            if ua != ub:
+                return None
+            keys = [kd for kd in set(ea) | set(eb) if ea.get(kd, (None, None))[1] != eb.get(kd, (None, None))[1]]
+            added = any(kd not in ea for kd in keys)
+            recs = [(self.cov.dk["look"].get(f"{o}|{name}", {}), self.cov.dk["whole"].get(f"{o}|{name}", [])) for o in owners]
+            if not any(lk or wh for lk, wh in recs):
+                return None  # never read at run time: only through something built at import
+            for lk, wh in recs:
+                out.update(wh)
+                if added:
+                    for ts in lk.values():
+                        out.update(ts)
+                    continue
+                for kd in keys:
+                    k = (ea.get(kd) or eb.get(kd))[0]
+                    reps = self._key_reps(k)
+                    if reps is None:
+                        return None
+                    for r in reps:
+                        out.update(lk.get(r, ()))
+        return out if changed_any else None
 
     def cmp_refine(self, rel, old_text, new_text, name, got):
         """Drop tests that evaluated the swapped comparison and never saw old/new disagree."""
@@ -774,7 +999,12 @@ class Selector:
             for l in lam_lines:
                 got.update(per.get(l, ()))
             return got
-        # 2. data read elsewhere: every test that created this class (or a subclass)
+        # 2. a class-level dict literal where only entries changed: the tests that looked up a changed
+        #    key (or read the whole dict) at run time
+        dk = self.dict_key_tests(rel, cls, old_nodes, new_nodes)
+        if dk is not None:
+            return dk
+        # 3. data read elsewhere: every test that created this class (or a subclass)
         inst = self.class_users(rel, cls)
         if inst is not None:
             return inst | self.class_scope(rel, ou, cls)
@@ -891,22 +1121,32 @@ class Selector:
         self.nonfunc_change = False
         self.patched_texts = {}
         picked = self._select(patch_text)
-        td = self.num_of.get(TPCDS)
-        if td in picked:
-            files = [f["old"] or f["new"] for f in parse_patch(patch_text)]
-            log(f"tpcds candidate: files={files} nonfunc={self.nonfunc_change} import_time={sorted(self.import_time_files)} lines={ {k: len(v) for k, v in self.changed_lines.items()} }")
-            if all(f.startswith("sqlglot/") and f.endswith(".py") for f in files) and not self.nonfunc_change \
-                    and not self.import_time_files and self.tpcds_proof():
-                log("tpcds proof: unchanged, dropping test_execute_tpcds")
-                picked.discard(td)
-        gm = self.num_of.get(GENMEM)
-        if gm in picked and gm not in self.func_picked:
-            files = [f["old"] or f["new"] for f in parse_patch(patch_text)]
-            if not any(f.startswith(GENMEM_FILES) for f in files):
-                picked.discard(gm)
+        files = [f["old"] or f["new"] for f in parse_patch(patch_text)]
+        py = all(f.startswith("sqlglot/") and f.endswith(".py") for f in files)
         if self.import_time_files and not self.import_ok(self.import_time_files):
             log("import fails after this patch: selecting everything")
             return set(self.all)
+        # test_generator_memory: generator construction only (see GENMEM)
+        gm = self.num_of.get(GENMEM)
+        if gm in picked and gm not in self.func_picked and not any(f.startswith(GENMEM_FILES) for f in files):
+            picked.discard(gm)
+        if gm in picked and py and self.genmem_proof(files):
+            log("generator_memory check passed on the patched code: dropping it")
+            picked.discard(gm)
+        td = self.num_of.get(TPCDS)
+        if td in picked and py:
+            if not self.nonfunc_change and not self.import_time_files and self.tpcds_proof():
+                log("tpcds proof: unchanged, dropping test_execute_tpcds")
+                picked.discard(td)
+            elif self.nonfunc_change and all(is_dialect_module(f) for f in files) and self.tpcds_proof(all_early=True):
+                # class-level edits in dialect-specific modules: planning/execution never use these
+                # classes, so equal early-stage outputs for every entry prove the test unchanged
+                log("tpcds proof (dialect class data): unchanged, dropping test_execute_tpcds")
+                picked.discard(td)
+        mx = self.num_of.get(MAXNODES)
+        if mx in picked and py and self.maxnodes_proof():
+            log("max_nodes proof: replica unchanged, dropping test_max_nodes")
+            picked.discard(mx)
         return picked
 
     def _select(self, patch_text):
