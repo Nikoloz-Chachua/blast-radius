@@ -38,6 +38,8 @@ class CovMap:
         self.fix_setup = raw.get("fix_setup", {})
         rp = path.parent / "covmap_rt.json.gz"
         self.runtime = CovMap(rp) if rp.exists() and path.name != "covmap_rt.json.gz" else None
+        ap = path.parent / "armap.json.gz"
+        self.ar = json.loads(gzip.decompress(ap.read_bytes())) if ap.exists() and path.name == "covmap.json.gz" else None
         dp = path.parent / "dkmap.json.gz"
         self.dk = json.loads(gzip.decompress(dp.read_bytes())) if dp.exists() and path.name == "covmap.json.gz" else None
         cp = path.parent / "cmpmap.json.gz"
@@ -313,6 +315,8 @@ IMPORT_MACHINERY = {
 GENMEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
 GENMEM_FILES = ("sqlglot/generator.py", "sqlglot/generators/", "sqlglot/dialects/dialect.py",
                 "sqlglot/dialects/__init__.py", "sqlglot/helper.py")
+# derived/class-read names precomputed from the pinned source (same scan as below)
+NAMES_FILE = HERE / "names.json"
 MAXNODES = "tests/test_parser.py::TestParser::test_max_nodes"
 MAXNODES_COV = HERE / "maxnodes_cov.json"
 MAXNODES_DIGEST = Path(os.environ.get("MAXNODES_DIGEST", "/app/maxnodes_digest.json"))
@@ -373,6 +377,7 @@ class Selector:
         self._src_cache = {}
         self._runtime = {}
         self._derived = None
+        self._class_reads = None
         self._py_files = None
         self.import_time_files = {}
         self._overlay = None
@@ -545,6 +550,10 @@ class Selector:
         import_time = bool(touched & uns) or set(ou) != set(nu) or any(
             k in ("body", "class") and nu.get(n) is not None and nu[n][2] != d
             for n, (k, _, d, _) in ou.items())
+        if import_time and not (touched & uns) and set(ou) == set(nu) and self.constant_only(ou, nu):
+            # only literal values changed in class/module statements (no new names, no structure
+            # change): evaluating the statement cannot raise; baked settings still get the check
+            import_time = False
         if import_time and rel.startswith("sqlglot/"):
             self.import_time_files[rel] = new_text
         if import_time and rel in EAGER_MODULES:
@@ -653,6 +662,43 @@ class Selector:
             return got - drop
         return got
 
+    def constant_only(self, ou, nu):
+        """True when every changed class/module-level statement differs only in literal constants and
+        assigns no baked setting; function bodies are not import-time code here."""
+        for name, (kind, node, dump, cls) in ou.items():
+            other = nu.get(name)
+            if other is None or other[2] == dump:
+                continue
+            if kind == "func":
+                continue
+            if kind != "body":
+                return False
+            a_nodes, b_nodes = node, other[1]
+            if len(a_nodes) != len(b_nodes):
+                return False
+            for a, b in zip(a_nodes, b_nodes):
+                if ast.dump(a) == ast.dump(b):
+                    continue
+                for n in ast.walk(a):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and (n.id in BAKED_NAMES):
+                        return False
+                xa, xb = list(ast.walk(a)), list(ast.walk(b))
+                if len(xa) != len(xb):
+                    return False
+                for x, y in zip(xa, xb):
+                    if type(x) is not type(y):
+                        return False
+                    if isinstance(x, ast.Constant):
+                        if type(x.value) is not type(y.value):
+                            return False
+                        continue
+                    for field, vx in ast.iter_fields(x):
+                        if isinstance(vx, ast.AST) or (isinstance(vx, list) and vx and isinstance(vx[0], ast.AST)):
+                            continue
+                        if vx != getattr(y, field, None):
+                            return False
+        return True
+
     def is_class_machinery(self, node, cls, ou, rel=None):
         if node.name in ("__init_subclass__", "__set_name__", "__class_getitem__"):
             return True
@@ -759,7 +805,9 @@ class Selector:
             if all_early:
                 if early_digests is None:
                     return False
-                affected = {int(k) for k in early_digests}
+                # non-executed entries are only parsed with the default dialect, which a
+                # dialect-specific module cannot change
+                affected = {int(k) for k in early_digests if k in self._tpcds_executed()}
                 mode = "early"
                 digests = early_digests
                 return self._tpcds_run(mode, affected, digests)
@@ -784,6 +832,18 @@ class Selector:
         except Exception as e:
             log(f"tpcds proof error {e!r}")
             return False
+
+    def _tpcds_executed(self):
+        if getattr(self, "_tpcds_exec", None) is None:
+            text = (self.src / "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql").read_text()
+            body = "\n".join(l for l in text.splitlines() if l and not l.startswith("--"))
+            st = body.split(";")
+            ex = set()
+            for idx, i in enumerate(range(0, len(st), 2)):
+                if i + 1 < len(st) and "# execute: true" in st[i].strip().split("\n")[0:3].__str__():
+                    ex.add(str(idx))
+            self._tpcds_exec = ex
+        return self._tpcds_exec
 
     def _tpcds_run(self, mode, affected, digests):
         import shutil, subprocess, tempfile
@@ -832,6 +892,8 @@ class Selector:
     def _derived_names(self):
         """Class-level names that some class body or module level reads other than through a
         `{**X.NAME, ...}` merge into the same NAME: their values get baked into other attributes."""
+        if self._derived is None and NAMES_FILE.exists():
+            self._derived = set(json.loads(NAMES_FILE.read_text())["derived"]) | set(BAKED_NAMES)
         if self._derived is None:
             out = set(BAKED_NAMES)
             for rel in self.py_files():
@@ -883,6 +945,65 @@ class Selector:
         if isinstance(node, ast.Tuple) and all(isinstance(e, ast.Constant) for e in node.elts):
             return {repr(tuple(e.value for e in node.elts))}
         return None
+
+    def _class_read_names(self):
+        """UPPERCASE names read through a class object (cls.X, klass.X, SomeClass.X, type(self).X)
+        anywhere in sqlglot: such reads bypass the instance hook used to record reads."""
+        if self._class_reads is None and NAMES_FILE.exists():
+            self._class_reads = set(json.loads(NAMES_FILE.read_text())["class_reads"])
+        if self._class_reads is None:
+            out = set()
+            for rel in self.py_files():
+                if not rel.startswith("sqlglot/"):
+                    continue
+                try:
+                    tree = ast.parse(self.read(rel) or "")
+                except SyntaxError:
+                    continue
+                for n in ast.walk(tree):
+                    if isinstance(n, ast.Attribute) and n.attr.isupper() and len(n.attr) > 1:
+                        v = n.value
+                        if isinstance(v, ast.Name) and (v.id in ("cls", "klass", "mcs", "metacls") or v.id[:1].isupper()):
+                            out.add(n.attr)
+                        elif isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "type":
+                            out.add(n.attr)
+                        elif isinstance(v, ast.Attribute) and v.attr in ("__class__",) :
+                            out.add(n.attr)
+                        elif isinstance(v, ast.Attribute) and v.attr[:1].isupper() and not v.attr.isupper():
+                            out.add(n.attr)  # module.Class.X
+            self._class_reads = out
+        return self._class_reads
+
+    def attr_read_tests(self, rel, cls, old_nodes, new_nodes):
+        if not self.cov.ar or len(old_nodes) != len(new_nodes):
+            return None
+        mod = rel[:-3].replace("/", ".")
+        qual = ".".join(part.split("#")[0] for part in cls.split("."))
+        me = f"{mod}:{qual}"
+        out = set()
+        changed_any = False
+        for a, b in zip(old_nodes, new_nodes):
+            if ast.dump(a) == ast.dump(b):
+                continue
+            changed_any = True
+            names = []
+            for st in (a, b):
+                if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+                    names.append(st.targets[0].id)
+                elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+                    names.append(st.target.id)
+                else:
+                    return None
+            if names[0] != names[1]:
+                return None
+            name = names[0]
+            if not name.isupper() or name in self._derived_names() or name in self._class_read_names():
+                return None
+            got = self.cov.ar.get(f"{me}|{name}")
+            if not got:
+                return None  # never read through an instance: something else consumes it
+            out.update(got)
+        return out if changed_any else None
 
     def dict_key_tests(self, rel, cls, old_nodes, new_nodes):
         if not self.cov.dk or len(old_nodes) != len(new_nodes):
@@ -1004,7 +1125,12 @@ class Selector:
         dk = self.dict_key_tests(rel, cls, old_nodes, new_nodes)
         if dk is not None:
             return dk
-        # 3. data read elsewhere: every test that created this class (or a subclass)
+        # 3. plain settings (NAME = value) read through instances: the tests whose reads resolved to
+        #    this class's definition
+        ar = self.attr_read_tests(rel, cls, old_nodes, new_nodes)
+        if ar is not None:
+            return ar
+        # 4. data read elsewhere: every test that created this class (or a subclass)
         inst = self.class_users(rel, cls)
         if inst is not None:
             return inst | self.class_scope(rel, ou, cls)

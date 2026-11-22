@@ -17,10 +17,14 @@ For each patch, `selector.py`:
      the tests that looked up a changed key or read the whole dict (`dkmap.json.gz`, recorded with
      wrapping dicts in a fork-per-test run); added keys select every test that used the dict; dicts
      that class-building code compiles into other structures are excluded;
+   - a plain class-level setting (`NAME = value`) selects the tests whose reads of NAME through an
+     instance resolved to that class's definition (`armap.json.gz`, recorded with a
+     `__getattribute__` hook in a fork-per-test run); settings also read through class objects or
+     derived into other settings (`names.json`, scanned from the pinned source) are excluded;
    - other class-level settings select every test that created that class (or a subclass);
    - code that builds classes while modules import (metaclass, `__init_subclass__` and their
      helpers) selects every test.
-4. If import-time code changed, it test-imports a patched scratch copy (every module and dialect for
+4. If import-time code changed (beyond literal values in non-baked settings), it test-imports a patched scratch copy (every module and dialect for
    core modules, otherwise the changed module and its dialect); if anything breaks, it selects every
    test.
 5. Fixture files map to the tests that opened them. The TPC-H/TPC-DS files that
