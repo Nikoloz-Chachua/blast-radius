@@ -274,9 +274,18 @@ def node_range(node):
 
 # tests that run sqlglot in a child process (coverage cannot see inside it)
 SUBPROCESS_TESTS = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}
+# fixture files TestExecutor.setUpClass loads (tables + query lists) -> the tests that use them
+_EX = "tests/test_executor.py::TestExecutor::"
+SETUP_FIXTURE_USERS = {
+    "tests/fixtures/optimizer/tpc-h/": [_EX + "test_optimized_tpch", _EX + "test_execute_tpch"],
+    "tests/fixtures/optimizer/tpc-ds/": [_EX + "test_execute_tpcds"],
+}
+TPC_QUERY_FILES = {"tests/fixtures/optimizer/tpc-h/tpc-h.sql", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"}
 # test classes that build shared state in setUpClass
-SETUP_CLASSES = {"tests/test_executor.py::TestExecutor", "tests/test_optimizer.py::TestOptimizer",
-                 "tests/test_lineage.py::TestLineage", "tests/test_sqlglotc.py::TestSQLGlotC"}
+# (class -> modules its setUpClass runs: executor tables + pool initializer, MappingSchema)
+SETUP_CLASSES = {"tests/test_executor.py::TestExecutor": ("sqlglot/executor/", "sqlglot/schema.py"),
+                 "tests/test_optimizer.py::TestOptimizer": ("sqlglot/schema.py",),
+                 "tests/test_lineage.py::TestLineage": ("sqlglot/schema.py",)}
 # modules imported by a bare `import sqlglot`
 EAGER_MODULES = {
     "sqlglot/__init__.py", "sqlglot/_typing.py", "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py",
@@ -321,6 +330,8 @@ class Selector:
         for t in tests:
             self.by_class.setdefault(t["id"].rsplit("::", 1)[0], set()).add(t["number"])
         self.cls_of = {t["number"]: t["id"].rsplit("::", 1)[0] for t in tests}
+        self.num_of = {t["id"]: t["number"] for t in tests}
+        self.tests_by_num = {t["number"]: t for t in tests}
 
     def read(self, rel):
         if rel not in self._src_cache:
@@ -487,7 +498,7 @@ class Selector:
                     picked |= whole | self.file_scope(rel)
                     if cls:
                         picked |= self.class_users(rel, cls.split(".")[0]) or set()
-                    picked |= self.setup_class_expand(picked)
+                    picked |= self.setup_class_expand(picked, rel)
                 if other is None:
                     # removed method: anything using its class may now dispatch differently
                     picked |= self.class_scope(rel, ou, cls)
@@ -526,12 +537,39 @@ class Selector:
         got = self.cov.cls.get(f"{mod}:{qual}")
         return set(got) if got is not None else None
 
-    def setup_class_expand(self, picked):
-        """Classes with setUpClass build shared state once; credit goes to their first test only."""
+    def tpc_queries(self, rel, hunks, got):
+        """Parse old/new TPC query files like tests/helpers.load_sql_fixture_pairs does."""
+        old = self.read(rel)
+        if old is None:
+            return got
+        new = apply_hunks(old, hunks)
+
+        def pairs(text):
+            body = "\n".join(l for l in text.splitlines() if l and not l.startswith("--"))
+            st = body.split(";")
+            return [(st[i].strip(), st[i + 1].strip()) for i in range(0, len(st), 2) if i + 1 < len(st)]
+
+        po, pn = pairs(old), pairs(new)
+        if len(po) != len(pn):
+            return got
+        src_changed = any(a[0] != b[0] for a, b in zip(po, pn))
+        any_changed = src_changed or any(a[1] != b[1] for a, b in zip(po, pn))
+        if not any_changed:
+            return set()
+        if not src_changed:
+            # only expected outputs changed: executor runs of the input queries are unaffected
+            drop = {self.num_of.get(_EX + "test_execute_tpch"), self.num_of.get(_EX + "test_execute_tpcds")}
+            return got - drop
+        return got
+
+    def setup_class_expand(self, picked, rel):
+        """Classes with setUpClass build shared state once; credit goes to their first test only.
+        Expand only when the changed module is one that setUpClass itself runs."""
         extra = set()
         for n in picked:
             c = self.cls_of[n]
-            if c in SETUP_CLASSES:
+            prefixes = SETUP_CLASSES.get(c)
+            if prefixes and any(rel.startswith(p) for p in prefixes):
                 extra |= self.by_class.get(c, set())
         return extra
 
@@ -709,8 +747,16 @@ class Selector:
                 picked |= self.python_change(rel, old_text, new_text, f["hunks"])
             elif rel.startswith("tests/fixtures/") or rel.startswith("tests/"):
                 got = set(self.cov.fix.get(rel, ()))
-                if got and not rel.endswith(".sql"):
-                    # data files are often loaded once per class (setUpClass): whole classes
+                # files loaded once in TestExecutor.setUpClass: credit went to its first test only
+                for prefix, ids in SETUP_FIXTURE_USERS.items():
+                    if rel.startswith(prefix):
+                        # executor tests credited only because they ran setUpClass first
+                        got = {n for n in got if not self.tests_by_num[n]["id"].startswith(_EX)}
+                        got |= {self.num_of[i] for i in ids if i in self.num_of}
+                if rel in TPC_QUERY_FILES and f["old"] and f["new"]:
+                    got = self.tpc_queries(rel, f["hunks"], got)
+                if got and not rel.endswith(".sql") and not any(rel.startswith(p) for p in SETUP_FIXTURE_USERS):
+                    # other data files: whole classes of the tests that read them
                     for n in list(got):
                         got |= self.by_class.get(self.cls_of[n], set())
                 if not got:

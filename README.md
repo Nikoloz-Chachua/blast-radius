@@ -15,11 +15,13 @@ For each patch, `selector.py`:
      test orders) select every user of the module, plus whole `setUpClass` test classes.
 4. If import-time code changed, it imports every sqlglot module and builds every dialect from a
    patched scratch copy; if anything new breaks, it selects every test.
-5. Fixture files map to the tests that opened them (data files: their whole test class).
+5. Fixture files map to the tests that opened them. The TPC-H/TPC-DS files that
+   `TestExecutor.setUpClass` loads map to the executor tests that use them (query inputs vs expected
+   outputs are told apart by parsing both versions like the tests do).
 6. Splits the chosen tests across 1–8 workers, picking the worker count with the lowest cost.
 
 ## Pre-existing code and data
-- `src.tar.gz`: sqlglot's `.py` files at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` (MIT License, https://github.com/tobymao/sqlglot).
+- `src.tar.gz`: sqlglot's `.py` files and the TPC-H/TPC-DS query fixtures at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` (MIT License, https://github.com/tobymao/sqlglot).
 - `covmap.json.gz`, `cmpmap.json.gz`: built from the pinned commit only, by running sqlglot's own
   test suite under coverage (two test orders) and under an instrumented copy that records
   comparison outcomes per test.
