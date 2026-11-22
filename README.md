@@ -22,11 +22,18 @@ For each patch, `selector.py`:
 5. Fixture files map to the tests that opened them. The TPC-H/TPC-DS files that
    `TestExecutor.setUpClass` loads map to the executor tests that use them (query inputs vs expected
    outputs are told apart by parsing both versions like the tests do).
-6. Splits the chosen tests across 1–8 workers, picking the worker count with the lowest cost.
+6. `test_execute_tpcds` (21.5 s) is dropped only on proof: `tpcds_cov.json.gz` records which source
+   lines each TPC-DS entry reaches (and which run in shared setup or in the late planning/execution
+   stages). When only function bodies changed and none of those lines run in setup, the selector
+   replays just the entries that reach them on the patched code (`tpcds_harness.py`) and compares
+   digests with the unpatched ones computed during the Docker build: the early stages only (parse,
+   pickle round trip, optimizer output and types, DuckDB transpile) when no changed line runs in
+   planning or execution, otherwise the full execution for up to 30 entries.
+7. Splits the chosen tests across 1–8 workers, picking the worker count with the lowest cost.
 
 ## Pre-existing code and data
-- `src.tar.gz`: sqlglot's `.py` files and the TPC-H/TPC-DS query fixtures at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` (MIT License, https://github.com/tobymao/sqlglot).
-- `covmap.json.gz`, `covmap_rt.json.gz`, `cmpmap.json.gz`: built from the pinned commit only, by running sqlglot's own
+- `src.tar.gz`: sqlglot's `.py` files, test helpers and the TPC-H/TPC-DS fixtures (queries and TPC-DS data) at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` (MIT License, https://github.com/tobymao/sqlglot).
+- `covmap.json.gz`, `covmap_rt.json.gz`, `cmpmap.json.gz`, `tpcds_cov.json.gz`: built from the pinned commit only, by running sqlglot's own
   test suite under coverage (two test orders) and under an instrumented copy that records
   comparison outcomes per test.
 

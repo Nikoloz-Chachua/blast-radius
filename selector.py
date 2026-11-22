@@ -303,6 +303,12 @@ IMPORT_MACHINERY = {
 GENMEM = "tests/test_generator.py::TestGenerator::test_generator_memory"
 GENMEM_FILES = ("sqlglot/generator.py", "sqlglot/generators/", "sqlglot/dialects/dialect.py",
                 "sqlglot/dialects/__init__.py", "sqlglot/helper.py")
+TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_COV = HERE / "tpcds_cov.json.gz"
+TPCDS_DIGESTS = Path(os.environ.get("TPCDS_DIGESTS", "/app/tpcds_digests.json"))
+TPCDS_RAW = Path(os.environ.get("TPCDS_RAW", "/app/tpcds_raw.pkl"))
+TPCDS_EARLY = Path(os.environ.get("TPCDS_EARLY", "/app/tpcds_early.json"))
+TPCDS_MAX_ENTRIES = 30
 TPC_QUERY_FILES = {"tests/fixtures/optimizer/tpc-h/tpc-h.sql", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"}
 # test classes that build shared state in setUpClass
 # (class -> modules its setUpClass runs: executor tables + pool initializer, MappingSchema)
@@ -345,9 +351,12 @@ class Selector:
         for t in tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
         self._src_cache = {}
+        self._runtime = {}
         self._py_files = None
         self.import_time_files = {}
         self._overlay = None
+        self._baseline = "unset"
+        self._tpcds = None
         self.subprocess_tests = {t["number"] for t in tests if t["id"] in SUBPROCESS_TESTS}
         self.by_class = {}
         for t in tests:
@@ -392,15 +401,45 @@ class Selector:
                         out.update(self.by_file.get(rel, ()))
         return out
 
+    def runtime_lines(self, rel):
+        """Lines that run when code is called (function bodies), not when the module is imported
+        (def/decorator lines, class bodies, module level): import-time lines are credited to every
+        test that imports the module."""
+        if rel not in self._runtime:
+            text = self.read(rel)
+            out = set()
+            try:
+                for n in ast.walk(ast.parse(text or "")):
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        body = n.body if isinstance(n.body, list) else [n.body]
+                        out.update(range(body[0].lineno, n.end_lineno + 1))
+            except SyntaxError:
+                pass
+            self._runtime[rel] = out
+        return self._runtime[rel]
+
+    def cov_runtime(self, rel, start, end):
+        rt = self.runtime_lines(rel)
+        per = self.cov.file(rel)
+        out = set()
+        for ln in range(start, end + 1):
+            if ln in rt:
+                s = per.get(ln)
+                if s:
+                    out.update(s)
+        return out
+
     def class_scope(self, rel, old_units, cls):
         if cls is None:
             return self.file_scope(rel)
         node = old_units[cls][1]
         s, e = node_range(node)
-        return self.cov.range(rel, s, e)
+        return self.cov_runtime(rel, s, e)
 
     def file_scope(self, rel):
-        out = self.cov.whole_file(rel)
+        text = self.read(rel)
+        n = (text or "").count("\n") + 1
+        out = self.cov_runtime(rel, 1, n) if rel.startswith("sqlglot/") else self.cov.whole_file(rel)
         if rel.startswith("tests/"):
             out |= self.by_file.get(rel, set())
         return out
@@ -459,7 +498,7 @@ class Selector:
                 want.update(range(st.lineno, first_child))
             else:
                 want.update(range(st.lineno, st.end_lineno + 1))
-            if parent is not func:
+            if parent is not func and not isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 pf = None
                 for field in ("body", "handlers", "cases"):
                     sub = getattr(parent, field, None)
@@ -499,7 +538,7 @@ class Selector:
                 continue
             if kind == "func":
                 rng = node_range(node)
-                whole = self.cov.range(rel, *rng)
+                whole = self.cov_runtime(rel, *rng)
                 got = None
                 want = None
                 if other is not None and sig_dump(node) == sig_dump(other[1]):
@@ -514,6 +553,15 @@ class Selector:
                     got = self.cmp_refine(rel, old_text, new_text, name, got)
                 picked |= whole if got is None else got
                 self.func_picked |= whole if got is None else got
+                if other is None:
+                    self.nonfunc_change = True
+                else:
+                    rng_lines = set(range(rng[0], rng[1] + 1))
+                    if got is None or want is None:
+                        self.changed_lines.setdefault(rel, set()).update(rng_lines)
+                    else:
+                        self.changed_lines.setdefault(rel, set()).update(want)
+                        self.changed_lines[rel].update(l for l in touched if rng[0] <= l <= rng[1])
                 # class-building code that runs while modules import (metaclasses, __init_subclass__):
                 # its results are baked into classes every test uses
                 if self.is_class_machinery(node, cls, ou, rel) and {l for l in touched if rng[0] <= l <= rng[1]} & self.cov.eager.get(rel, set()):
@@ -524,10 +572,12 @@ class Selector:
                     if cls:
                         picked |= self.class_users(rel, cls) or set()
             elif kind == "class":
+                self.nonfunc_change = True
                 picked |= self.class_scope(rel, ou, name)
                 names_needing_refs.add(name.split(".")[-1])
                 picked |= self.class_users(rel, name) or set()
             else:  # body statements of a class or module
+                self.nonfunc_change = True
                 if cls is None:
                     picked |= self.file_scope(rel)
                     names_needing_refs |= self.changed_names(node, other[1] if other else [])
@@ -536,6 +586,7 @@ class Selector:
         for name, (kind, node, dump, cls) in nu.items():
             if name in ou:
                 continue
+            self.nonfunc_change = True
             # new function / class: its container decides who can reach it
             if cls is not None and cls in ou:
                 picked |= self.class_scope(rel, ou, cls)
@@ -593,6 +644,70 @@ class Selector:
                 if name == "type":
                     return True
         return False
+
+    def tpcds_proof(self):
+        """Re-run the TPC-DS entries that reach the changed lines on the patched code; True when
+        every digest matches the unpatched one computed at build time."""
+        import shutil, subprocess, tempfile
+        try:
+            if not TPCDS_COV.exists() or not TPCDS_DIGESTS.exists() or not TPCDS_RAW.exists():
+                return False
+            if self._tpcds is None:
+                raw = json.loads(gzip.decompress(TPCDS_COV.read_bytes()))
+                setup, late = {}, {}
+                for rel, ln in raw["setup"]:
+                    setup.setdefault(rel, set()).add(ln)
+                for rel, ln in raw.get("late", []):
+                    late.setdefault(rel, set()).add(ln)
+                early = json.loads(TPCDS_EARLY.read_text()) if TPCDS_EARLY.exists() else None
+                self._tpcds = (setup, late, raw["entries"], json.loads(TPCDS_DIGESTS.read_text()), early)
+            setup, late, entries, digests, early_digests = self._tpcds
+            affected = set()
+            for rel, lines in self.changed_lines.items():
+                if lines & setup.get(rel, set()):
+                    log(f"tpcds proof: changed lines run in setup {sorted(lines & setup.get(rel, set()))[:5]}")
+                    return False
+                per = entries.get(rel, {})
+                for ln in lines:
+                    affected.update(per.get(str(ln), ()))
+            in_late = any(lines & late.get(rel, set()) for rel, lines in self.changed_lines.items())
+            # early-stage proof: the changed lines run only before planning, so equal early outputs
+            # mean planning and execution get identical input and run identical code
+            mode = "early" if (not in_late and early_digests is not None) else "digest"
+            if not affected or (mode == "digest" and len(affected) > TPCDS_MAX_ENTRIES):
+                log(f"tpcds proof: {len(affected)} entries affected ({mode})")
+                return False
+            if mode == "early":
+                digests = early_digests
+            if self._overlay is None:
+                self._overlay = tempfile.mkdtemp(prefix="br_")
+                shutil.copytree(self.src / "sqlglot", os.path.join(self._overlay, "sqlglot"))
+            try:
+                for rel, text in self.patched_texts.items():
+                    with open(os.path.join(self._overlay, rel), "w") as fh:
+                        fh.write(text)
+                env = dict(os.environ, PYTHONPATH=self._overlay + os.pathsep + str(self.src),
+                           PYTHONDONTWRITEBYTECODE="1", PYTHONHASHSEED="0")
+                r = subprocess.run([sys.executable, str(HERE / "tpcds_harness.py"), mode, str(TPCDS_RAW),
+                                    str(self.src / "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"),
+                                    json.dumps(sorted(affected)),
+                                    str(TPCDS_EARLY if mode == "early" else TPCDS_DIGESTS)],
+                                   cwd=self._overlay, env=env, capture_output=True, text=True, timeout=120)
+            finally:
+                for rel in self.patched_texts:
+                    src = self.src / rel
+                    if src.exists():
+                        shutil.copy2(src, os.path.join(self._overlay, rel))
+            lines = [l for l in r.stdout.splitlines() if l.startswith("{")]
+            if r.returncode != 0 or not lines:
+                return False
+            got = json.loads(lines[-1])
+            ok = all(got.get(str(i)) == digests.get(str(i)) for i in affected)
+            log(f"tpcds proof ({mode}) on {len(affected)} entries: {'same' if ok else 'DIFFERENT'}")
+            return ok
+        except Exception as e:
+            log(f"tpcds proof error {e!r}")
+            return False
 
     def setup_class_expand(self, picked, rel):
         """Classes with setUpClass build shared state once; credit goes to their first test only.
@@ -747,6 +862,7 @@ class Selector:
             if self._overlay is None:
                 self._overlay = tempfile.mkdtemp(prefix="br_")
                 shutil.copytree(self.src / "sqlglot", os.path.join(self._overlay, "sqlglot"))
+            if self._baseline == "unset":
                 self._baseline = self._run_check()
                 log(f"import check baseline: {self._baseline}")
             if self._baseline is None:
@@ -771,7 +887,18 @@ class Selector:
     def select(self, patch_text):
         self.import_time_files = {}
         self.func_picked = set()
+        self.changed_lines = {}
+        self.nonfunc_change = False
+        self.patched_texts = {}
         picked = self._select(patch_text)
+        td = self.num_of.get(TPCDS)
+        if td in picked:
+            files = [f["old"] or f["new"] for f in parse_patch(patch_text)]
+            log(f"tpcds candidate: files={files} nonfunc={self.nonfunc_change} import_time={sorted(self.import_time_files)} lines={ {k: len(v) for k, v in self.changed_lines.items()} }")
+            if all(f.startswith("sqlglot/") and f.endswith(".py") for f in files) and not self.nonfunc_change \
+                    and not self.import_time_files and self.tpcds_proof():
+                log("tpcds proof: unchanged, dropping test_execute_tpcds")
+                picked.discard(td)
         gm = self.num_of.get(GENMEM)
         if gm in picked and gm not in self.func_picked:
             files = [f["old"] or f["new"] for f in parse_patch(patch_text)]
@@ -801,6 +928,7 @@ class Selector:
                 if path_new is None:
                     picked |= self.file_scope(rel) | self.module_importers(rel)
                     continue
+                self.patched_texts[rel] = new_text
                 picked |= self.python_change(rel, old_text, new_text, f["hunks"])
             elif rel.startswith("tests/fixtures/") or rel.startswith("tests/"):
                 got = set(self.cov.fix.get(rel, ()))
