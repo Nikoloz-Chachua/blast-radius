@@ -1174,33 +1174,40 @@ class Selector:
 
     def lambda_body_tests(self, rel, old_nodes, new_nodes, touched):
         """Edits that sit entirely inside lambda bodies run at call time: the tests that ran those
-        body lines (runtime coverage) are exact. None when any edit is outside a lambda body, or a
-        body line also ran while modules imported (its result may be baked in)."""
-        new_d = {ast.dump(n) for n in new_nodes}
-        changed = [n for n in old_nodes if ast.dump(n) not in new_d]
+        body lines (runtime coverage) are exact. The statements must be identical once every lambda
+        body is blanked out (so keys, arguments and defaults on the same line are unchanged). None
+        when that fails, or a changed body also ran while modules imported (its result is baked in)."""
+        import copy
+        if len(new_nodes) != len(old_nodes) or not old_nodes:
+            return None
+
+        def blank(n):
+            n2 = copy.deepcopy(n)
+            for x in ast.walk(n2):
+                if isinstance(x, ast.Lambda):
+                    x.body = ast.Constant(value=0)
+            return ast.dump(n2)
+
         lam_lines = set()
-        all_in_lambda = bool(changed)
-        for st in changed:
-            lines = {l for l in touched if st.lineno <= l <= st.end_lineno}
-            lams = [n for n in ast.walk(st) if isinstance(n, ast.Lambda)]
-            for l in lines:
-                inside = [lm for lm in lams if lm.body.lineno <= l <= lm.body.end_lineno]
-                if not inside:
-                    all_in_lambda = False
-                else:
-                    lm = min(inside, key=lambda x: x.end_lineno - x.lineno)
-                    lam_lines.update(range(lm.body.lineno, lm.body.end_lineno + 1))
-            if not lines:
-                all_in_lambda = False
-        if len(new_nodes) != len(old_nodes):
-            all_in_lambda = False
-        if all_in_lambda and lam_lines and not (lam_lines & self.cov.eager.get(rel, set())):
-            per = (self.cov.runtime or self.cov).file(rel)
-            got = set()
-            for l in lam_lines:
-                got.update(per.get(l, ()))
-            return got
-        return None
+        for o, nw in zip(old_nodes, new_nodes):
+            if ast.dump(o) == ast.dump(nw):
+                continue
+            if blank(o) != blank(nw):
+                return None
+            lo = [x for x in ast.walk(o) if isinstance(x, ast.Lambda)]
+            ln = [x for x in ast.walk(nw) if isinstance(x, ast.Lambda)]
+            if len(lo) != len(ln):
+                return None
+            for a, b in zip(lo, ln):
+                if ast.dump(a.body) != ast.dump(b.body):
+                    lam_lines.update(range(a.body.lineno, a.body.end_lineno + 1))
+        if not lam_lines or lam_lines & self.cov.eager.get(rel, set()):
+            return None
+        per = (self.cov.runtime or self.cov).file(rel)
+        got = set()
+        for l in lam_lines:
+            got.update(per.get(l, ()))
+        return got
 
     def _class_attr_rest(self, rel, ou, cls, old_nodes, new_nodes, changed):
         # 2. a class-level dict literal where only entries changed: the tests that looked up a changed
